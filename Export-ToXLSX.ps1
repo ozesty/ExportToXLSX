@@ -1,39 +1,125 @@
 function Export-ToXLSX {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory, ValueFromPipeline)]
-        [psobject]$InputObject,
+        [AllowNull()]
+        [psobject[]]$InputObject,
 
         [Parameter(Mandatory, Position = 0)]
         [string]$Path,
 
         [Alias('Properties')]
-        [string[]]$Property
+        [string[]]$Property,
+
+        [string]$WorksheetName = 'Export',
+
+        [switch]$NoClobber,
+
+        [switch]$TruncateLongValues,
+
+        [switch]$Strict
     )
 
     begin {
-        $maxDataRows = 1048575
-        $maxColumns = 16384
-        $maxCellCharacters = 32767
-        $culture = [Globalization.CultureInfo]::InvariantCulture
-        $utf8 = [Text.UTF8Encoding]::new($false)
+        $config = @{
+            MaxDataRows           = 1048575
+            MaxColumns            = 16384
+            MaxCellCharacters     = 32767
+            MinColumnWidth        = 10
+            MaxColumnWidth        = 60
+            ExcelMinDate          = [DateTime]'1900-03-01'
+            ExcelMaxDate          = [DateTime]'9999-12-31T23:59:59'
+            Culture               = [Globalization.CultureInfo]::InvariantCulture
+            Utf8                  = [Text.UTF8Encoding]::new($false)
+            TruncateLongValues    = $TruncateLongValues.IsPresent
+            XmlSpecialRegex       = [regex]::new(
+                '[\x00-\x08\x0B-\x1F\uD800-\uDFFF\uFFFE\uFFFF]|_x[0-9A-Fa-f]{4}_',
+                [Text.RegularExpressions.RegexOptions]::Compiled
+            )
+            XmlEscapePatternRegex = [regex]::new(
+                '_(?=x[0-9A-Fa-f]{4}_)',
+                [Text.RegularExpressions.RegexOptions]::Compiled
+            )
+        }
 
         Add-Type -AssemblyName System.IO.Compression
 
-        $resolvedPath = $ExecutionContext.SessionState.Path.
-            GetUnresolvedProviderPathFromPSPath($Path)
+        $provider = $null
+        $drive = $null
+        $sessionPath = $ExecutionContext.SessionState.Path
+        $resolvedPath = $sessionPath.GetUnresolvedProviderPathFromPSPath(
+            $Path,
+            [ref]$provider,
+            [ref]$drive
+        )
+        [void]$drive
+
+        if ($null -eq $provider -or $provider.Name -ne 'FileSystem') {
+            throw "Output path must use the FileSystem provider: $Path"
+        }
         if ([IO.Path]::GetExtension($resolvedPath) -ine '.xlsx') {
             throw "Output path must use the .xlsx extension: $resolvedPath"
         }
+        if ([IO.Directory]::Exists($resolvedPath)) {
+            throw "Output path is an existing directory: $resolvedPath"
+        }
+        if ($NoClobber -and [IO.File]::Exists($resolvedPath)) {
+            throw "Output file already exists and -NoClobber was specified: $resolvedPath"
+        }
         $directory = [IO.Path]::GetDirectoryName($resolvedPath)
+        if ([string]::IsNullOrEmpty($directory)) {
+            throw "Could not determine target directory for path: $resolvedPath"
+        }
+        $rootPath = [IO.Path]::GetPathRoot($resolvedPath)
+        if (-not [string]::IsNullOrEmpty($rootPath) -and -not [IO.Directory]::Exists($rootPath)) {
+            throw "Target drive or root path does not exist: $rootPath"
+        }
+
+        if (
+            [string]::IsNullOrWhiteSpace($WorksheetName) -or
+            $WorksheetName.Length -gt 31 -or
+            $WorksheetName -match '[:\\/\?\*\[\]]' -or
+            $WorksheetName.StartsWith("'") -or
+            $WorksheetName.EndsWith("'")
+        ) {
+            throw "Invalid worksheet name '$WorksheetName'. Names must be 1-31 characters, cannot contain : \ / ? * [ ], and cannot start or end with a single quote."
+        }
+
+        function Get-ColumnName {
+            param([int]$Number)
+
+            $name = ''
+            do {
+                $name = [char](65 + $Number % 26) + $name
+                $Number = [int][math]::Floor($Number / 26) - 1
+            }
+            while ($Number -ge 0)
+            $name
+        }
 
         $columns = [Collections.Generic.List[string]]::new()
+        $columnNames = [Collections.Generic.List[string]]::new()
+        $columnWidths = [Collections.Generic.List[int]]::new()
         $columnMap = [Collections.Generic.Dictionary[string, int]]::new(
             [StringComparer]::OrdinalIgnoreCase
         )
         $foundProperties = [Collections.Generic.HashSet[string]]::new(
             [StringComparer]::OrdinalIgnoreCase
         )
+
+        function Add-Column {
+            param([string]$Name)
+
+            if ($columns.Count -ge $config.MaxColumns) {
+                throw "Excel supports at most $($config.MaxColumns) columns."
+            }
+            $index = $columns.Count
+            $columnMap.Add($Name, $index)
+            $columns.Add($Name)
+            $columnNames.Add((Get-ColumnName -Number $index))
+            $columnWidths.Add([math]::Min($Name.Length, $config.MaxColumnWidth))
+            $index
+        }
 
         $explicitProperties = $PSBoundParameters.ContainsKey('Property')
         if ($explicitProperties) {
@@ -47,12 +133,13 @@ function Export-ToXLSX {
                 if ($columnMap.ContainsKey($name)) {
                     throw "Duplicate property '$name'."
                 }
-                $columnMap.Add($name, $columns.Count)
-                $columns.Add($name)
+                [void](Add-Column -Name $name)
             }
-            if ($columns.Count -gt $maxColumns) {
-                throw "Excel supports at most $maxColumns columns."
-            }
+        }
+
+        $shouldExport = $PSCmdlet.ShouldProcess($resolvedPath, 'Export XLSX')
+        if (-not $shouldExport) {
+            return
         }
 
         function Close-RowBuffer {
@@ -64,6 +151,30 @@ function Export-ToXLSX {
             }
         }
 
+        function Measure-ColumnWidth {
+            param(
+                [int]$ColumnIndex,
+                [int]$DisplayLength
+            )
+
+            if ($DisplayLength -gt $columnWidths[$ColumnIndex]) {
+                $columnWidths[$ColumnIndex] = [math]::Min($DisplayLength, $config.MaxColumnWidth)
+            }
+        }
+
+        function Get-DisplayLength {
+            param([string]$Text)
+
+            if ([string]::IsNullOrEmpty($Text)) { return 0 }
+            if ($Text.IndexOf("`n") -lt 0) { return $Text.Length }
+
+            $longest = 0
+            foreach ($line in ($Text -split "`r?`n")) {
+                if ($line.Length -gt $longest) { $longest = $line.Length }
+            }
+            $longest
+        }
+
         function ConvertTo-XmlString {
             param(
                 [AllowNull()][string]$Text,
@@ -71,18 +182,31 @@ function Export-ToXLSX {
                 [string]$Column
             )
 
-            if ($null -eq $Text) { $Text = '' }
-            if ($Text.Length -gt $maxCellCharacters) {
-                throw "Cell $Column$row exceeds Excel's $maxCellCharacters-character limit."
+            if ([string]::IsNullOrEmpty($Text)) { return '' }
+            if ($Text.Length -gt $config.MaxCellCharacters) {
+                if ($config.TruncateLongValues) {
+                    $truncatedLength = $config.MaxCellCharacters
+                    if (
+                        $truncatedLength -gt 0 -and
+                        [char]::IsHighSurrogate($Text[$truncatedLength - 1])
+                    ) {
+                        $truncatedLength--
+                    }
+                    $Text = $Text.Substring(0, $truncatedLength)
+                    Write-Warning "Cell $Column$Row exceeded Excel's $($config.MaxCellCharacters)-character limit and was truncated."
+                }
+                else {
+                    throw "Cell $Column$Row exceeds Excel's $($config.MaxCellCharacters)-character limit."
+                }
+            }
+
+            if (-not $config.XmlSpecialRegex.IsMatch($Text)) {
+                return [Security.SecurityElement]::Escape($Text)
             }
 
             # Protect literal SpreadsheetML escape-looking text before creating
             # escapes for characters XML cannot represent directly.
-            $Text = [regex]::Replace(
-                $Text,
-                '_(?=x[0-9A-Fa-f]{4}_)',
-                '_x005F_'
-            )
+            $Text = $config.XmlEscapePatternRegex.Replace($Text, '_x005F_')
 
             $clean = [Text.StringBuilder]::new($Text.Length)
             for ($index = 0; $index -lt $Text.Length; $index++) {
@@ -105,7 +229,7 @@ function Export-ToXLSX {
                     [void]$clean.Append([char]0xFFFD)
                 }
                 elseif ($character -eq "`r" -or -not [Xml.XmlConvert]::IsXmlChar($character)) {
-                    [void]$clean.Append('_x{0:X4}_' -f [int]$character)
+                    [void]$clean.Append(('_x{0:X4}_' -f [int]$character))
                 }
                 else {
                     [void]$clean.Append($character)
@@ -119,38 +243,33 @@ function Export-ToXLSX {
             param($Value)
 
             if ($null -eq $Value -or $Value -is [DBNull]) { return '' }
+            if ($Value -is [string]) { return $Value }
             if ($Value -is [byte[]]) {
                 return [Convert]::ToBase64String($Value)
             }
-            if ($Value -is [DateTimeOffset]) {
-                return $Value.ToString('o', $culture)
+            if ($Value -is [DateTimeOffset] -or $Value -is [DateTime]) {
+                return $Value.ToString('o', $config.Culture)
             }
-            if ($Value -is [Collections.IEnumerable] -and $Value -isnot [string]) {
-                $parts = foreach ($item in $Value) {
-                    if ($null -eq $item) { '' }
+            if ($Value -is [Collections.IEnumerable]) {
+                $parts = [Collections.Generic.List[string]]::new()
+                foreach ($item in $Value) {
+                    if ($null -eq $item -or $item -is [DBNull]) {
+                        $parts.Add('')
+                    }
                     elseif ($item -is [byte[]]) {
-                        [Convert]::ToBase64String($item)
+                        $parts.Add([Convert]::ToBase64String($item))
                     }
-                    elseif ($item -is [DateTimeOffset]) {
-                        $item.ToString('o', $culture)
+                    elseif ($item -is [DateTimeOffset] -or $item -is [DateTime]) {
+                        $parts.Add($item.ToString('o', $config.Culture))
                     }
-                    else { [string]$item }
+                    else {
+                        $parts.Add([string]$item)
+                    }
                 }
-                return [string]($parts -join '; ')
+                if ($parts.Count -eq 0) { return '' }
+                return [string]::Join('; ', $parts)
             }
             [string]$Value
-        }
-
-        function Get-ColumnName {
-            param([int]$Number)
-
-            $name = ''
-            do {
-                $name = [char](65 + $Number % 26) + $name
-                $Number = [math]::Floor($Number / 26) - 1
-            }
-            while ($Number -ge 0)
-            $name
         }
 
         function Get-InlineStringCell {
@@ -159,13 +278,18 @@ function Export-ToXLSX {
                 $Value,
                 [int]$Row,
                 [string]$Column,
+                [int]$ColumnIndex,
                 [int]$Style = 0
             )
 
-            $text = ConvertTo-XmlString (ConvertTo-TextValue $Value) $Row $Column
+            $rawText = ConvertTo-TextValue -Value $Value
+            if ($rawText.Length -eq 0 -and $Style -eq 0) {
+                return ''
+            }
+            Measure-ColumnWidth -ColumnIndex $ColumnIndex -DisplayLength (Get-DisplayLength -Text $rawText)
+            $text = ConvertTo-XmlString -Text $rawText -Row $Row -Column $Column
             $styleAttribute = if ($Style) { ' s="{0}"' -f $Style } else { '' }
-            '<c r="{0}"{1} t="inlineStr"><is><t xml:space="preserve">{2}</t></is></c>' -f
-                $Reference, $styleAttribute, $text
+            '<c r="{0}"{1} t="inlineStr"><is><t xml:space="preserve">{2}</t></is></c>' -f $Reference, $styleAttribute, $text
         }
 
         function Get-SignificantDigitCount {
@@ -181,149 +305,175 @@ function Export-ToXLSX {
                 [string]$Reference,
                 $Value,
                 [int]$Row,
-                [string]$Column
+                [string]$Column,
+                [int]$ColumnIndex
             )
 
             if ($null -eq $Value -or $Value -is [DBNull]) {
-                return '<c r="{0}"/>' -f $Reference
+                return ''
+            }
+            if ($Value -is [string]) {
+                return Get-InlineStringCell -Reference $Reference -Value $Value -Row $Row -Column $Column -ColumnIndex $ColumnIndex
             }
             if ($Value -is [bool]) {
-                return '<c r="{0}" t="b"><v>{1}</v></c>' -f
-                    $Reference, [int]$Value
+                Measure-ColumnWidth -ColumnIndex $ColumnIndex -DisplayLength 5
+                return '<c r="{0}" t="b"><v>{1}</v></c>' -f $Reference, [int]$Value
             }
             if ($Value -is [DateTime]) {
-                if ($Value -lt [DateTime]'1900-03-01') {
-                    return Get-InlineStringCell $Reference `
-                        $Value.ToString('o', $culture) $Row $Column
+                if ($Value -lt $config.ExcelMinDate -or $Value -gt $config.ExcelMaxDate) {
+                    $isoDate = $Value.ToString('o', $config.Culture)
+                    return Get-InlineStringCell -Reference $Reference -Value $isoDate -Row $Row -Column $Column -ColumnIndex $ColumnIndex
                 }
-                $serialDate = $Value.ToOADate().ToString('G17', $culture)
-                return '<c r="{0}" s="2"><v>{1}</v></c>' -f
-                    $Reference, $serialDate
+                Measure-ColumnWidth -ColumnIndex $ColumnIndex -DisplayLength 19
+                $serialDate = $Value.ToOADate().ToString('G17', $config.Culture)
+                return '<c r="{0}" s="2"><v>{1}</v></c>' -f $Reference, $serialDate
             }
             if ($Value.GetType().IsEnum) {
-                return Get-InlineStringCell $Reference $Value $Row $Column
+                return Get-InlineStringCell -Reference $Reference -Value $Value -Row $Row -Column $Column -ColumnIndex $ColumnIndex
             }
 
             $typeCode = [Type]::GetTypeCode($Value.GetType())
-            $number = $null
-            $exactNumber = $null
 
             switch ($typeCode) {
-                SByte   { $number = $Value.ToString($culture) }
-                Byte    { $number = $Value.ToString($culture) }
-                Int16   { $number = $Value.ToString($culture) }
-                UInt16  { $number = $Value.ToString($culture) }
-                Int32   { $number = $Value.ToString($culture) }
-                UInt32  { $number = $Value.ToString($culture) }
-                Int64   { $number = $Value.ToString($culture) }
-                UInt64  { $number = $Value.ToString($culture) }
-                Decimal { $number = $Value.ToString($culture) }
+                { $_ -in 'SByte', 'Byte', 'Int16', 'UInt16', 'Int32', 'UInt32' } {
+                    $number = $Value.ToString($config.Culture)
+                    Measure-ColumnWidth -ColumnIndex $ColumnIndex -DisplayLength $number.Length
+                    return '<c r="{0}"><v>{1}</v></c>' -f $Reference, $number
+                }
+                { $_ -in 'Int64', 'UInt64', 'Decimal' } {
+                    $exactNumber = $Value.ToString($config.Culture)
+                    if ((Get-SignificantDigitCount -Number $exactNumber) -gt 15) {
+                        return Get-InlineStringCell -Reference $Reference -Value $exactNumber -Row $Row -Column $Column -ColumnIndex $ColumnIndex
+                    }
+                    Measure-ColumnWidth -ColumnIndex $ColumnIndex -DisplayLength $exactNumber.Length
+                    return '<c r="{0}"><v>{1}</v></c>' -f $Reference, $exactNumber
+                }
                 Single {
                     if ([single]::IsNaN($Value) -or [single]::IsInfinity($Value)) {
-                        return Get-InlineStringCell $Reference $Value $Row $Column
+                        return Get-InlineStringCell -Reference $Reference -Value $Value -Row $Row -Column $Column -ColumnIndex $ColumnIndex
                     }
-                    $number = $Value.ToString('G9', $culture)
+                    $number = $Value.ToString('G9', $config.Culture)
+                    Measure-ColumnWidth -ColumnIndex $ColumnIndex -DisplayLength $number.Length
+                    return '<c r="{0}"><v>{1}</v></c>' -f $Reference, $number
                 }
                 Double {
                     if ([double]::IsNaN($Value) -or [double]::IsInfinity($Value)) {
-                        return Get-InlineStringCell $Reference $Value $Row $Column
+                        return Get-InlineStringCell -Reference $Reference -Value $Value -Row $Row -Column $Column -ColumnIndex $ColumnIndex
                     }
-                    $number = $Value.ToString('G15', $culture)
-                    try { $roundTrip = [double]::Parse($number, $culture) }
+                    $magnitude = [math]::Abs($Value)
+                    if (
+                        $magnitude -gt 9.99999999999999E+307 -or
+                        ($magnitude -ne 0 -and $magnitude -lt 2.2250738585072E-308)
+                    ) {
+                        $exactDouble = $Value.ToString('G17', $config.Culture)
+                        return Get-InlineStringCell -Reference $Reference -Value $exactDouble -Row $Row -Column $Column -ColumnIndex $ColumnIndex
+                    }
+                    $number = $Value.ToString('G15', $config.Culture)
+                    try { $roundTrip = [double]::Parse($number, $config.Culture) }
                     catch { $roundTrip = $null }
                     if ($null -eq $roundTrip -or $roundTrip -ne $Value) {
-                        $exactNumber = $Value.ToString('G17', $culture)
+                        $number = $Value.ToString('G17', $config.Culture)
                     }
+                    Measure-ColumnWidth -ColumnIndex $ColumnIndex -DisplayLength ([math]::Min($number.Length, 15))
+                    return '<c r="{0}"><v>{1}</v></c>' -f $Reference, $number
                 }
             }
 
-            if ($number) {
-                if (-not $exactNumber) { $exactNumber = $number }
-                $magnitude = [math]::Abs([double]$Value)
-                if (
-                    (Get-SignificantDigitCount $exactNumber) -gt 15 -or
-                    $magnitude -gt 9.99999999999999E+307 -or
-                    ($magnitude -ne 0 -and $magnitude -lt 2.2250738585072E-308)
-                ) {
-                    return Get-InlineStringCell `
-                        $Reference $exactNumber $Row $Column
-                }
-                return '<c r="{0}"><v>{1}</v></c>' -f $Reference, $number
-            }
-
-            Get-InlineStringCell $Reference $Value $Row $Column
+            Get-InlineStringCell -Reference $Reference -Value $Value -Row $Row -Column $Column -ColumnIndex $ColumnIndex
         }
 
         $rowCount = 0
         $rowWriter = $null
         $rowStream = $null
+        $rowXml = [Text.StringBuilder]::new(4096)
+        $rowValues = [Collections.Generic.SortedDictionary[int, object]]::new()
         $rowPath = [IO.Path]::Combine(
             [IO.Path]::GetTempPath(),
             'xlsx-' + [guid]::NewGuid().ToString('N') + '.tmp'
         )
-        $rowStream = [IO.FileStream]::new(
-            $rowPath,
-            [IO.FileMode]::CreateNew,
-            [IO.FileAccess]::ReadWrite,
-            [IO.FileShare]::None,
-            65536,
-            [IO.FileOptions]::DeleteOnClose
-        )
-        $rowWriter = [IO.StreamWriter]::new($rowStream, $utf8, 65536, $true)
+        try {
+            $rowStream = [IO.FileStream]::new(
+                $rowPath,
+                [IO.FileMode]::CreateNew,
+                [IO.FileAccess]::ReadWrite,
+                [IO.FileShare]::None,
+                65536,
+                [IO.FileOptions]::DeleteOnClose
+            )
+            $rowWriter = [IO.StreamWriter]::new($rowStream, $config.Utf8, 65536, $true)
+        }
+        catch {
+            Close-RowBuffer
+            throw
+        }
     }
 
     process {
+        if (-not $shouldExport -or $null -eq $InputObject) {
+            return
+        }
+
         try {
-            if ($rowCount -ge $maxDataRows) {
-                throw "Excel supports at most $maxDataRows data rows when a header is present."
-            }
+            foreach ($item in $InputObject) {
+                if ($null -eq $item) { continue }
 
-            $excelRow = $rowCount + 2
-            $rowXml = [Text.StringBuilder]::new()
-            [void]$rowXml.Append('<row r="{0}">' -f $excelRow)
+                if ($rowCount -ge $config.MaxDataRows) {
+                    throw "Excel supports at most $($config.MaxDataRows) data rows when a header is present."
+                }
 
-            if ($explicitProperties) {
-                for ($index = 0; $index -lt $columns.Count; $index++) {
-                    $name = $columns[$index]
-                    $itemProperty = $InputObject.PSObject.Properties[$name]
-                    $value = $null
-                    if ($null -ne $itemProperty) {
+                $excelRow = $rowCount + 2
+                [void]$rowXml.Clear()
+                [void]$rowXml.Append(('<row r="{0}">' -f $excelRow))
+
+                if ($explicitProperties) {
+                    for ($index = 0; $index -lt $columns.Count; $index++) {
+                        $name = $columns[$index]
+                        $itemProperty = $item.PSObject.Properties[$name]
+                        if ($null -eq $itemProperty -or -not $itemProperty.IsGettable) {
+                            continue
+                        }
                         [void]$foundProperties.Add($name)
                         $value = $itemProperty.Value
-                    }
-                    $columnName = Get-ColumnName $index
-                    [void]$rowXml.Append((
-                        Get-CellXml ($columnName + $excelRow) `
-                            $value $excelRow $columnName
-                    ))
-                }
-            }
-            else {
-                $rowValues = [Collections.Generic.SortedDictionary[int, object]]::new()
-                foreach ($itemProperty in $InputObject.PSObject.Properties) {
-                    $name = $itemProperty.Name
-                    if (-not $columnMap.ContainsKey($name)) {
-                        if ($columns.Count -ge $maxColumns) {
-                            throw "Excel supports at most $maxColumns columns."
+                        if ($null -eq $value -or $value -is [DBNull]) {
+                            continue
                         }
-                        $columnMap.Add($name, $columns.Count)
-                        $columns.Add($name)
+                        $columnName = $columnNames[$index]
+                        $cellXml = Get-CellXml -Reference ($columnName + $excelRow) -Value $value -Row $excelRow -Column $columnName -ColumnIndex $index
+                        if ($cellXml.Length -gt 0) {
+                            [void]$rowXml.Append($cellXml)
+                        }
                     }
-                    $rowValues[$columnMap[$name]] = $itemProperty.Value
+                }
+                else {
+                    $rowValues.Clear()
+                    foreach ($itemProperty in $item.PSObject.Properties) {
+                        if (-not $itemProperty.IsGettable) { continue }
+                        $name = $itemProperty.Name
+                        $columnIndex = 0
+                        if (-not $columnMap.TryGetValue($name, [ref]$columnIndex)) {
+                            $columnIndex = Add-Column -Name $name
+                        }
+                        $rowValues[$columnIndex] = $itemProperty.Value
+                    }
+
+                    foreach ($pair in $rowValues.GetEnumerator()) {
+                        $value = $pair.Value
+                        if ($null -eq $value -or $value -is [DBNull]) {
+                            continue
+                        }
+                        $columnIndex = $pair.Key
+                        $columnName = $columnNames[$columnIndex]
+                        $cellXml = Get-CellXml -Reference ($columnName + $excelRow) -Value $value -Row $excelRow -Column $columnName -ColumnIndex $columnIndex
+                        if ($cellXml.Length -gt 0) {
+                            [void]$rowXml.Append($cellXml)
+                        }
+                    }
                 }
 
-                foreach ($pair in $rowValues.GetEnumerator()) {
-                    $columnName = Get-ColumnName $pair.Key
-                    [void]$rowXml.Append((
-                        Get-CellXml ($columnName + $excelRow) `
-                            $pair.Value $excelRow $columnName
-                    ))
-                }
+                [void]$rowXml.Append('</row>')
+                $rowWriter.Write($rowXml.ToString())
+                $rowCount++
             }
-
-            [void]$rowXml.Append('</row>')
-            $rowWriter.Write($rowXml.ToString())
-            $rowCount++
         }
         catch {
             Close-RowBuffer
@@ -332,6 +482,10 @@ function Export-ToXLSX {
     }
 
     end {
+        if (-not $shouldExport) {
+            return
+        }
+
         $outputStream = $null
         $zip = $null
         $temporaryOutput = $null
@@ -345,8 +499,11 @@ function Export-ToXLSX {
                     }
                 )
                 if ($missing.Count) {
-                    throw ('Properties not found in the input: {0}' -f
-                        ($missing -join ', '))
+                    $missingMessage = 'Properties not found in the input: {0}' -f ($missing -join ', ')
+                    if ($Strict) {
+                        throw $missingMessage
+                    }
+                    Write-Warning $missingMessage
                 }
             }
 
@@ -373,57 +530,82 @@ function Export-ToXLSX {
             )
 
             function Add-Part {
-                param([string]$Name, [string]$Content)
+                param(
+                    [string]$Name,
+                    [string]$Content
+                )
 
                 $entry = $zip.CreateEntry($Name)
-                $writer = [IO.StreamWriter]::new($entry.Open(), $utf8)
+                $writer = [IO.StreamWriter]::new($entry.Open(), $config.Utf8)
                 try { $writer.Write($Content) }
                 finally { $writer.Dispose() }
             }
 
-            Add-Part '[Content_Types].xml' @'
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>
-'@
-            Add-Part '_rels/.rels' @'
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>
-'@
-            Add-Part 'xl/workbook.xml' @'
-<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Export" sheetId="1" r:id="rId1"/></sheets></workbook>
-'@
-            Add-Part 'xl/_rels/workbook.xml.rels' @'
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>
-'@
-            Add-Part 'xl/styles.xml' @'
-<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy-mm-dd hh:mm:ss"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>
-'@
+            $xmlHeader = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            $escapedSheetName = [Security.SecurityElement]::Escape($WorksheetName)
 
-            $entryStream = $zip.CreateEntry(
-                'xl/worksheets/sheet1.xml'
-            ).Open()
+            $contentTypesXml = $xmlHeader + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>'
+            $rootRelsXml = $xmlHeader + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
+            $workbookXml = $xmlHeader + ('<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="{0}" sheetId="1" r:id="rId1"/></sheets></workbook>' -f $escapedSheetName)
+            $workbookRelsXml = $xmlHeader + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>'
+            $stylesXml = $xmlHeader + '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy-mm-dd hh:mm:ss"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>'
+
+            Add-Part -Name '[Content_Types].xml' -Content $contentTypesXml
+            Add-Part -Name '_rels/.rels' -Content $rootRelsXml
+            Add-Part -Name 'xl/workbook.xml' -Content $workbookXml
+            Add-Part -Name 'xl/_rels/workbook.xml.rels' -Content $workbookRelsXml
+            Add-Part -Name 'xl/styles.xml' -Content $stylesXml
+
+            $entryStream = $zip.CreateEntry('xl/worksheets/sheet1.xml').Open()
             $worksheetWriter = [IO.StreamWriter]::new(
                 $entryStream,
-                $utf8,
+                $config.Utf8,
                 65536,
                 $true
             )
             try {
                 $worksheetWriter.Write(
-                    '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+                    $xmlHeader +
+                    '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
                 )
+                $rangeRef = $null
+                if ($columns.Count) {
+                    $lastColumnName = $columnNames[$columns.Count - 1]
+                    $lastRow = $rowCount + 1
+                    $rangeRef = 'A1:{0}{1}' -f $lastColumnName, $lastRow
+                    $worksheetWriter.Write(('<dimension ref="{0}"/>' -f $rangeRef))
+                    $worksheetWriter.Write(
+                        '<sheetViews><sheetView tabSelected="1" workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+                    )
+                    $worksheetWriter.Write('<cols>')
+                    for ($index = 0; $index -lt $columns.Count; $index++) {
+                        $width = [math]::Min(
+                            [math]::Max($columnWidths[$index] + 3, $config.MinColumnWidth),
+                            $config.MaxColumnWidth
+                        )
+                        $colNumber = $index + 1
+                        $worksheetWriter.Write(('<col min="{0}" max="{0}" width="{1}" customWidth="1"/>' -f $colNumber, $width))
+                    }
+                    $worksheetWriter.Write('</cols>')
+                }
+
+                $worksheetWriter.Write('<sheetData>')
                 if ($columns.Count) {
                     $worksheetWriter.Write('<row r="1">')
                     for ($index = 0; $index -lt $columns.Count; $index++) {
-                        $columnName = Get-ColumnName $index
-                        $worksheetWriter.Write((
-                            Get-InlineStringCell ($columnName + '1') `
-                                $columns[$index] 1 $columnName 1
-                        ))
+                        $columnName = $columnNames[$index]
+                        $headerCell = Get-InlineStringCell -Reference ($columnName + '1') -Value $columns[$index] -Row 1 -Column $columnName -ColumnIndex $index -Style 1
+                        $worksheetWriter.Write($headerCell)
                     }
                     $worksheetWriter.Write('</row>')
                 }
                 $worksheetWriter.Flush()
                 $rowStream.CopyTo($entryStream)
-                $worksheetWriter.Write('</sheetData></worksheet>')
+                $worksheetWriter.Write('</sheetData>')
+                if ($rangeRef) {
+                    $worksheetWriter.Write(('<autoFilter ref="{0}"/>' -f $rangeRef))
+                }
+                $worksheetWriter.Write('</worksheet>')
             }
             finally {
                 $worksheetWriter.Dispose()
@@ -436,20 +618,12 @@ function Export-ToXLSX {
             $outputStream = $null
 
             if ([IO.File]::Exists($resolvedPath)) {
-                $backupOutput = [IO.Path]::Combine(
-                    $directory,
-                    '.xlsx-' + [guid]::NewGuid().ToString('N') + '.bak'
-                )
                 [IO.File]::Replace(
                     $temporaryOutput,
                     $resolvedPath,
-                    $backupOutput
+                    [NullString]::Value
                 )
                 $committed = $true
-                try { [IO.File]::Delete($backupOutput) }
-                catch {
-                    Write-Warning "Export succeeded, but the backup remains: $backupOutput"
-                }
             }
             else {
                 [IO.File]::Move($temporaryOutput, $resolvedPath)

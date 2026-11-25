@@ -57,6 +57,9 @@ automatically unless explicitly requested via `-Property`.
 - `-InputObject` (Mandatory, Pipeline): One or more objects to export.
 - `-Property` (Alias: `Properties`): Explicit ordered list of property names to
   export as columns.
+- `-ExcludeProperty` (Alias: `ExcludeProperties`): Property names or wildcard
+  patterns (case-insensitive, e.g. `SID`, `Object*`) to exclude from the
+  exported columns.
 - `-WorksheetName`: Custom worksheet name (default: `Export`, 1–31 characters,
   validated against Excel naming rules).
 - `-NoClobber`: Prevents overwriting an existing `.xlsx` file.
@@ -91,6 +94,16 @@ Get-ADUser -Filter * -Properties Mail, Department, Title |
 `Get-ADUser -Properties` retrieves additional attributes from Active Directory;
 it does not restrict which properties are displayed. Use `Select-Object` or the
 exporter's `-Property` parameter when you need an exact column list.
+
+To keep automatic column discovery while omitting a few default attributes
+(such as `SID`, `ObjectGUID`, or `ObjectClass`), use `-ExcludeProperty`
+(wildcards are supported):
+
+```powershell
+Get-ADUser -Filter * -Properties Mail, Department |
+    Export-ToXLSX -Path 'X:\temp\users.xlsx' `
+        -ExcludeProperty SID, Object*
+```
 
 Calculated properties work as expected:
 
@@ -208,6 +221,9 @@ the value with a warning when `-TruncateLongValues` is specified.
     `AddedProperties`, `RemovedProperties`, `ModifiedProperties`,
     `PropertyCount`) when `-Property` is omitted.
 - **Excel UX & CLI enhancements**
+  - Added `-ExcludeProperty` (alias `ExcludeProperties`) with case-insensitive
+    exact and wildcard matching to drop columns such as `SID` or `Object*`
+    while preserving automatic column discovery.
   - Added auto-sized column widths (`<cols>`), frozen header row (`<sheetViews>`),
     worksheet `<dimension>`, and `<autoFilter>`.
   - Added `-WorksheetName` (with Excel naming validation), `-NoClobber`, and

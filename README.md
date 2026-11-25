@@ -22,7 +22,7 @@ not required by the exporter itself.
 Clone or download this repository, then dot-source the script:
 
 ```powershell
-. .\Export-ToXLSX.ps1
+. .\ExportToXLSX.ps1
 ```
 
 The `Export-ToXLSX` command is then available in the current PowerShell session.
@@ -54,14 +54,17 @@ automatically unless explicitly requested via `-Property`.
 
 - `-Path` (Mandatory, Position 0): Output `.xlsx` file path on the `FileSystem`
   provider.
-- `-InputObject` (Mandatory, Pipeline): One or more objects to export.
+- `-InputObject` (Mandatory, Pipeline): Objects to export (accepts `$null` and
+  empty arrays/collections).
 - `-Property` (Alias: `Properties`): Explicit ordered list of property names to
-  export as columns.
+  export as columns (rejects empty/whitespace names and case-insensitive
+  duplicates).
 - `-ExcludeProperty` (Alias: `ExcludeProperties`): Property names or wildcard
   patterns (case-insensitive, e.g. `SID`, `Object*`) to exclude from the
-  exported columns.
+  exported columns (rejects whitespace patterns and also filters `-Property`).
 - `-WorksheetName`: Custom worksheet name (default: `Export`, 1–31 characters,
-  validated against Excel naming rules).
+  validated against Excel naming rules and rejecting control/XML-invalid
+  characters and unpaired UTF-16 surrogates).
 - `-NoClobber`: Prevents overwriting an existing `.xlsx` file.
 - `-TruncateLongValues`: Truncates cell values exceeding Excel's 32,767-character
   limit (with a warning, preserving UTF-16 surrogate pairs) instead of failing
@@ -149,24 +152,31 @@ do not cause network requests.
 
 ## Value handling
 
-- Strings are XML-escaped and stored as inline strings.
+- Non-empty strings are XML-escaped and stored as inline strings.
 - Strings beginning with `=` remain text and are not executed as formulas.
 - Booleans are stored as Excel boolean cells.
-- Integers (`SByte`–`UInt32`), `Single`, and in-range `Double` values are stored
-  as numeric cells using exact round-trip formatting (`G15`/`G17` for `Double`).
+- Enum values are stored as text rather than their underlying integer value.
+- Integers (`SByte`–`UInt32`), `Int64`/`UInt64`/`Decimal` values with 15 or
+  fewer significant digits, finite `Single`, and in-range `Double` values are
+  stored as numeric cells using exact round-trip formatting (`G7`/`G9` for
+  `Single`, `G15`/`G17` for `Double`).
 - `Int64`, `UInt64`, and `Decimal` values with more than 15 significant digits
   (such as 18-digit AD FileTimes like `lastLogon` or `accountExpires`), as well
   as out-of-range/non-finite floating-point values, are stored as text instead
   of being silently rounded.
-- Dates from 1 March 1900 through 31 December 9999 are stored as Excel dates.
-- Earlier/later dates and `DateTimeOffset` values are stored as ISO-8601 text.
+- Dates from `1900-03-01T00:00:00` through `9999-12-31T23:59:59` are stored as
+  Excel dates.
+- Earlier/later dates (including fractional seconds after `9999-12-31T23:59:59`,
+  such as `[DateTime]::MaxValue`) and `DateTimeOffset` values are stored as
+  ISO-8601 text.
 - Collections are joined with `; ` (with nested `DateTime` and `DateTimeOffset`
   items formatted as ISO-8601, and nested `byte[]` items Base64-encoded).
-- Empty collections and `$null`/`DBNull` values are omitted so Excel treats them
-  as blank cells.
+- Empty strings (`''`), empty collections, and `$null`/`DBNull` values are
+  omitted so Excel treats them as blank cells.
 - Byte arrays are Base64-encoded.
 - XML control characters and literal `_xHHHH_` sequences are preserved using
-  SpreadsheetML escaping.
+  SpreadsheetML escaping, and unpaired UTF-16 surrogates are replaced with
+  `U+FFFD`.
 - Columns are auto-sized (clamped to 10–60 characters so `DateTime` values do
   not display as `########`), native date cells use `yyyy-mm-dd hh:mm:ss`, and
   bold headers (`-BoldHeader`), frozen headers (`-FreezeHeader`), and
@@ -249,3 +259,9 @@ the value with a warning when `-TruncateLongValues` is specified.
     Default, `PSGallery`, `CodeFormatting`, and PS 5.1/7.x compatibility rules),
     removed `'@)` here-strings and backtick continuations, switched helper calls
     to named parameters, and eliminated unused variables.
+- **Hardening & edge-case polish**
+  - Added `[AllowEmptyCollection()]` on `-InputObject` so direct empty-array
+    calls (`-InputObject @()`) succeed, enforced `-NoClobber` atomically at file
+    commit, added `G7`/`G9` round-trip formatting for `[single]` values,
+    rejected control/XML-invalid characters and unpaired UTF-16 surrogates in
+    `-WorksheetName`, and added fail-fast invalid filename character validation.

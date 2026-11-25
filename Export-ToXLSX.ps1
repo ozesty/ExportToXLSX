@@ -20,7 +20,12 @@ function Export-ToXLSX {
 
         [switch]$TruncateLongValues,
 
-        [switch]$Strict
+        [switch]$Strict,
+
+        [switch]$BoldHeader,
+
+        [Alias('Sortable')]
+        [switch]$AutoFilter
     )
 
     begin {
@@ -35,6 +40,8 @@ function Export-ToXLSX {
             Culture               = [Globalization.CultureInfo]::InvariantCulture
             Utf8                  = [Text.UTF8Encoding]::new($false)
             TruncateLongValues    = $TruncateLongValues.IsPresent
+            BoldHeader            = $BoldHeader.IsPresent
+            AutoFilter            = $AutoFilter.IsPresent
             XmlSpecialRegex       = [regex]::new(
                 '[\x00-\x08\x0B-\x1F\uD800-\uDFFF\uFFFE\uFFFF]|_x[0-9A-Fa-f]{4}_',
                 [Text.RegularExpressions.RegexOptions]::Compiled
@@ -664,10 +671,11 @@ function Export-ToXLSX {
 
                 $worksheetWriter.Write('<sheetData>')
                 if ($columns.Count) {
+                    $headerStyle = if ($config.BoldHeader) { 1 } else { 0 }
                     $worksheetWriter.Write('<row r="1">')
                     for ($index = 0; $index -lt $columns.Count; $index++) {
                         $columnName = $columnNames[$index]
-                        $headerCell = Get-InlineStringCell -Reference ($columnName + '1') -Value $columns[$index] -Row 1 -Column $columnName -ColumnIndex $index -Style 1
+                        $headerCell = Get-InlineStringCell -Reference ($columnName + '1') -Value $columns[$index] -Row 1 -Column $columnName -ColumnIndex $index -Style $headerStyle
                         $worksheetWriter.Write($headerCell)
                     }
                     $worksheetWriter.Write('</row>')
@@ -675,7 +683,7 @@ function Export-ToXLSX {
                 $worksheetWriter.Flush()
                 $rowStream.CopyTo($entryStream)
                 $worksheetWriter.Write('</sheetData>')
-                if ($rangeRef) {
+                if ($config.AutoFilter -and $rangeRef) {
                     $worksheetWriter.Write(('<autoFilter ref="{0}"/>' -f $rangeRef))
                 }
                 $worksheetWriter.Write('</worksheet>')

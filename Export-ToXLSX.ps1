@@ -25,7 +25,9 @@ function Export-ToXLSX {
         [switch]$BoldHeader,
 
         [Alias('Sortable')]
-        [switch]$AutoFilter
+        [switch]$AutoFilter,
+
+        [switch]$FreezeHeader
     )
 
     begin {
@@ -42,6 +44,7 @@ function Export-ToXLSX {
             TruncateLongValues    = $TruncateLongValues.IsPresent
             BoldHeader            = $BoldHeader.IsPresent
             AutoFilter            = $AutoFilter.IsPresent
+            FreezeHeader          = $FreezeHeader.IsPresent
             XmlSpecialRegex       = [regex]::new(
                 '[\x00-\x08\x0B-\x1F\uD800-\uDFFF\uFFFE\uFFFF]|_x[0-9A-Fa-f]{4}_',
                 [Text.RegularExpressions.RegexOptions]::Compiled
@@ -654,9 +657,11 @@ function Export-ToXLSX {
                     $lastRow = $rowCount + 1
                     $rangeRef = 'A1:{0}{1}' -f $lastColumnName, $lastRow
                     $worksheetWriter.Write(('<dimension ref="{0}"/>' -f $rangeRef))
-                    $worksheetWriter.Write(
-                        '<sheetViews><sheetView tabSelected="1" workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
-                    )
+                    if ($config.FreezeHeader) {
+                        $worksheetWriter.Write(
+                            '<sheetViews><sheetView tabSelected="1" workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+                        )
+                    }
                     $worksheetWriter.Write('<cols>')
                     for ($index = 0; $index -lt $columns.Count; $index++) {
                         $width = [math]::Min(

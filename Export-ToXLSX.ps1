@@ -11,6 +11,9 @@ function Export-ToXLSX {
         [Alias('Properties')]
         [string[]]$Property,
 
+        [Alias('ExcludeProperties')]
+        [string[]]$ExcludeProperty,
+
         [string]$WorksheetName = 'Export',
 
         [switch]$NoClobber,
@@ -50,6 +53,10 @@ function Export-ToXLSX {
                 ),
                 [StringComparer]::OrdinalIgnoreCase
             )
+            ExcludedExact         = [Collections.Generic.HashSet[string]]::new(
+                [StringComparer]::OrdinalIgnoreCase
+            )
+            ExcludedPatterns      = [Collections.Generic.List[Management.Automation.WildcardPattern]]::new()
         }
 
         Add-Type -AssemblyName System.IO.Compression
@@ -131,6 +138,39 @@ function Export-ToXLSX {
             $index
         }
 
+        function Test-ExcludedProperty {
+            param([string]$Name)
+
+            if ($config.ExcludedExact.Count -gt 0 -and $config.ExcludedExact.Contains($Name)) {
+                return $true
+            }
+            foreach ($wildcard in $config.ExcludedPatterns) {
+                if ($wildcard.IsMatch($Name)) {
+                    return $true
+                }
+            }
+            $false
+        }
+
+        if ($PSBoundParameters.ContainsKey('ExcludeProperty') -and $ExcludeProperty) {
+            foreach ($pattern in $ExcludeProperty) {
+                if ([string]::IsNullOrWhiteSpace($pattern)) {
+                    throw 'ExcludeProperty names cannot be empty.'
+                }
+                if ([Management.Automation.WildcardPattern]::ContainsWildcardCharacters($pattern)) {
+                    $config.ExcludedPatterns.Add(
+                        [Management.Automation.WildcardPattern]::new(
+                            $pattern,
+                            [Management.Automation.WildcardOptions]::IgnoreCase
+                        )
+                    )
+                }
+                else {
+                    [void]$config.ExcludedExact.Add($pattern)
+                }
+            }
+        }
+
         $explicitProperties = $PSBoundParameters.ContainsKey('Property')
         if ($explicitProperties) {
             if (-not $Property -or -not $Property.Count) {
@@ -143,7 +183,13 @@ function Export-ToXLSX {
                 if ($columnMap.ContainsKey($name)) {
                     throw "Duplicate property '$name'."
                 }
+                if (Test-ExcludedProperty -Name $name) {
+                    continue
+                }
                 [void](Add-Column -Name $name)
+            }
+            if ($columns.Count -eq 0) {
+                throw 'All specified properties were excluded by -ExcludeProperty.'
             }
         }
 
@@ -468,6 +514,12 @@ function Export-ToXLSX {
                         if (-not $itemProperty.IsGettable) { continue }
                         $name = $itemProperty.Name
                         if ($isAdEntity -and $config.AdMetadataProperties.Contains($name)) {
+                            continue
+                        }
+                        if (
+                            ($config.ExcludedExact.Count -gt 0 -and $config.ExcludedExact.Contains($name)) -or
+                            ($config.ExcludedPatterns.Count -gt 0 -and (Test-ExcludedProperty -Name $name))
+                        ) {
                             continue
                         }
                         $columnIndex = 0

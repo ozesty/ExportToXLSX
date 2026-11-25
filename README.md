@@ -45,7 +45,10 @@ Export-ToXLSX -Path 'X:\temp\users.xlsx' -InputObject $users
 
 Without `-Property`, the function automatically creates a column for every
 property it encounters. Properties first encountered on later objects are also
-added as columns.
+added as columns. For Active Directory objects (`ADEntity`, such as `ADUser`),
+internal wrapper properties (`PropertyNames`, `AddedProperties`,
+`RemovedProperties`, `ModifiedProperties`, and `PropertyCount`) are skipped
+automatically unless explicitly requested via `-Property`.
 
 ## Parameters
 
@@ -200,7 +203,10 @@ the value with a warning when `-TruncateLongValues` is specified.
   - Added `-TruncateLongValues` with UTF-16 surrogate-safe truncation for large
     values such as `thumbnailPhoto` or large `MemberOf` lists.
   - Updated `$InputObject` to `[AllowNull()][psobject[]]` to support direct
-    array arguments as well as pipeline input, and skipped non-gettable properties.
+    array arguments as well as pipeline input, skipped non-gettable properties,
+    and automatically excluded internal AD wrapper properties (`PropertyNames`,
+    `AddedProperties`, `RemovedProperties`, `ModifiedProperties`,
+    `PropertyCount`) when `-Property` is omitted.
 - **Excel UX & CLI enhancements**
   - Added auto-sized column widths (`<cols>`), frozen header row (`<sheetViews>`),
     worksheet `<dimension>`, and `<autoFilter>`.

@@ -73,6 +73,8 @@ automatically unless explicitly requested via `-Property`.
 - `-BoldHeader`: Styles the header row (row 1) in bold. Off by default.
 - `-AutoFilter` (Alias: `Sortable`): Enables Excel AutoFilter sort and filter
   dropdowns on the header row. Off by default.
+- `-FreezeHeader`: Freezes the header row (row 1) while scrolling. Off by
+  default.
 - `-WhatIf` / `-Confirm`: Supported via `SupportsShouldProcess`.
 
 ## Choose the columns
@@ -136,11 +138,11 @@ content-type, and style parts using built-in .NET classes.
 
 While pipeline objects are processed, finished worksheet rows are streamed to a
 temporary buffer. At the end of the pipeline, the function writes the worksheet
-metadata (dimensions, frozen header pane, auto-sized column widths), header row,
-copies the buffered rows into the worksheet, optionally adds an AutoFilter
-(`-AutoFilter`), finalizes the ZIP package, and atomically replaces the
-requested output file. This avoids keeping the full data set and worksheet XML
-in memory.
+metadata (dimensions, optional frozen header pane via `-FreezeHeader`,
+auto-sized column widths), header row, copies the buffered rows into the
+worksheet, optionally adds an AutoFilter (`-AutoFilter`), finalizes the ZIP
+package, and atomically replaces the requested output file. This avoids keeping
+the full data set and worksheet XML in memory.
 
 The web-style namespace values inside the script are Open XML identifiers. They
 do not cause network requests.
@@ -165,9 +167,9 @@ do not cause network requests.
 - Byte arrays are Base64-encoded.
 - XML control characters and literal `_xHHHH_` sequences are preserved using
   SpreadsheetML escaping.
-- The header row is frozen, columns are auto-sized (clamped to 10–60
-  characters so `DateTime` values do not display as `########`), native date
-  cells use `yyyy-mm-dd hh:mm:ss`, and bold headers (`-BoldHeader`) plus
+- Columns are auto-sized (clamped to 10–60 characters so `DateTime` values do
+  not display as `########`), native date cells use `yyyy-mm-dd hh:mm:ss`, and
+  bold headers (`-BoldHeader`), frozen headers (`-FreezeHeader`), and
   sort/filter dropdowns (`-AutoFilter` / `-Sortable`) can be enabled on demand.
 
 ## Empty results and existing files
@@ -232,9 +234,9 @@ the value with a warning when `-TruncateLongValues` is specified.
   - Added `-ExcludeProperty` (alias `ExcludeProperties`) with case-insensitive
     exact and wildcard matching to drop columns such as `SID` or `Object*`
     while preserving automatic column discovery.
-  - Added auto-sized column widths (`<cols>`), frozen header row (`<sheetViews>`),
-    worksheet `<dimension>`, and opt-in `-BoldHeader` and `-AutoFilter`
-    (alias `Sortable`) switches.
+  - Added auto-sized column widths (`<cols>`), worksheet `<dimension>`, and
+    opt-in `-BoldHeader`, `-FreezeHeader`, and `-AutoFilter` (alias `Sortable`)
+    switches.
   - Added `-WorksheetName` (with Excel naming validation), `-NoClobber`, and
     `SupportsShouldProcess` (`-WhatIf`/`-Confirm`).
   - Added upfront `FileSystem` provider, directory-collision, and root-drive

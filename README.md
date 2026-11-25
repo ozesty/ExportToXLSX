@@ -70,6 +70,9 @@ automatically unless explicitly requested via `-Property`.
 - `-Strict`: Throws an error if any property specified in `-Property` is not
   present on any input object (by default, missing properties emit a warning and
   remain blank columns).
+- `-BoldHeader`: Styles the header row (row 1) in bold. Off by default.
+- `-AutoFilter` (Alias: `Sortable`): Enables Excel AutoFilter sort and filter
+  dropdowns on the header row. Off by default.
 - `-WhatIf` / `-Confirm`: Supported via `SupportsShouldProcess`.
 
 ## Choose the columns
@@ -92,8 +95,11 @@ Get-ADUser -Filter * -Properties Mail, Department, Title |
 ```
 
 `Get-ADUser -Properties` retrieves additional attributes from Active Directory;
-it does not restrict which properties are displayed. Use `Select-Object` or the
-exporter's `-Property` parameter when you need an exact column list.
+it does not restrict which properties are displayed and does not preserve the
+order of the attribute names you pass to it. Use `Select-Object` or the
+exporter's `-Property` parameter when you need an exact column list and order
+(the exporter preserves the exact property order from `-Property`,
+`Select-Object`, or incoming `PSCustomObject`s).
 
 To keep automatic column discovery while omitting a few default attributes
 (such as `SID`, `ObjectGUID`, or `ObjectClass`), use `-ExcludeProperty`
@@ -131,9 +137,10 @@ content-type, and style parts using built-in .NET classes.
 While pipeline objects are processed, finished worksheet rows are streamed to a
 temporary buffer. At the end of the pipeline, the function writes the worksheet
 metadata (dimensions, frozen header pane, auto-sized column widths), header row,
-copies the buffered rows into the worksheet, adds an AutoFilter, finalizes the
-ZIP package, and atomically replaces the requested output file. This avoids
-keeping the full data set and worksheet XML in memory.
+copies the buffered rows into the worksheet, optionally adds an AutoFilter
+(`-AutoFilter`), finalizes the ZIP package, and atomically replaces the
+requested output file. This avoids keeping the full data set and worksheet XML
+in memory.
 
 The web-style namespace values inside the script are Open XML identifiers. They
 do not cause network requests.
@@ -158,9 +165,10 @@ do not cause network requests.
 - Byte arrays are Base64-encoded.
 - XML control characters and literal `_xHHHH_` sequences are preserved using
   SpreadsheetML escaping.
-- The header row is bold and frozen, columns are auto-sized (clamped to 10–60
-  characters so `DateTime` values do not display as `########`), AutoFilter is
-  enabled across the exported table, and native date cells use `yyyy-mm-dd hh:mm:ss`.
+- The header row is frozen, columns are auto-sized (clamped to 10–60
+  characters so `DateTime` values do not display as `########`), native date
+  cells use `yyyy-mm-dd hh:mm:ss`, and bold headers (`-BoldHeader`) plus
+  sort/filter dropdowns (`-AutoFilter` / `-Sortable`) can be enabled on demand.
 
 ## Empty results and existing files
 
@@ -225,7 +233,8 @@ the value with a warning when `-TruncateLongValues` is specified.
     exact and wildcard matching to drop columns such as `SID` or `Object*`
     while preserving automatic column discovery.
   - Added auto-sized column widths (`<cols>`), frozen header row (`<sheetViews>`),
-    worksheet `<dimension>`, and `<autoFilter>`.
+    worksheet `<dimension>`, and opt-in `-BoldHeader` and `-AutoFilter`
+    (alias `Sortable`) switches.
   - Added `-WorksheetName` (with Excel naming validation), `-NoClobber`, and
     `SupportsShouldProcess` (`-WhatIf`/`-Confirm`).
   - Added upfront `FileSystem` provider, directory-collision, and root-drive

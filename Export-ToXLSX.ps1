@@ -3,6 +3,7 @@ function Export-ToXLSX {
     param(
         [Parameter(Mandatory, ValueFromPipeline)]
         [AllowNull()]
+        [AllowEmptyCollection()]
         [psobject[]]$InputObject,
 
         [Parameter(Mandatory, Position = 0)]
@@ -87,6 +88,13 @@ function Export-ToXLSX {
         if ([IO.Path]::GetExtension($resolvedPath) -ine '.xlsx') {
             throw "Output path must use the .xlsx extension: $resolvedPath"
         }
+        $fileName = [IO.Path]::GetFileName($resolvedPath)
+        if (
+            [string]::IsNullOrEmpty($fileName) -or
+            $fileName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0
+        ) {
+            throw "Output file name contains invalid characters: $resolvedPath"
+        }
         if ([IO.Directory]::Exists($resolvedPath)) {
             throw "Output path is an existing directory: $resolvedPath"
         }
@@ -102,14 +110,36 @@ function Export-ToXLSX {
             throw "Target drive or root path does not exist: $rootPath"
         }
 
-        if (
+        $invalidWorksheetName = (
             [string]::IsNullOrWhiteSpace($WorksheetName) -or
             $WorksheetName.Length -gt 31 -or
-            $WorksheetName -match '[:\\/\?\*\[\]]' -or
+            $WorksheetName -match '[:\\/\?\*\[\]\x00-\x1F\uFFFE\uFFFF]' -or
             $WorksheetName.StartsWith("'") -or
             $WorksheetName.EndsWith("'")
-        ) {
-            throw "Invalid worksheet name '$WorksheetName'. Names must be 1-31 characters, cannot contain : \ / ? * [ ], and cannot start or end with a single quote."
+        )
+        if (-not $invalidWorksheetName) {
+            for ($index = 0; $index -lt $WorksheetName.Length; $index++) {
+                $character = $WorksheetName[$index]
+                if ([char]::IsHighSurrogate($character)) {
+                    if (
+                        $index + 1 -lt $WorksheetName.Length -and
+                        [char]::IsLowSurrogate($WorksheetName[$index + 1])
+                    ) {
+                        $index++
+                    }
+                    else {
+                        $invalidWorksheetName = $true
+                        break
+                    }
+                }
+                elseif ([char]::IsLowSurrogate($character)) {
+                    $invalidWorksheetName = $true
+                    break
+                }
+            }
+        }
+        if ($invalidWorksheetName) {
+            throw "Invalid worksheet name '$WorksheetName'. Names must be 1-31 valid XML characters, cannot contain : \ / ? * [ ] or control characters, and cannot start or end with a single quote."
         }
 
         function Get-ColumnName {
@@ -418,7 +448,12 @@ function Export-ToXLSX {
                     if ([single]::IsNaN($Value) -or [single]::IsInfinity($Value)) {
                         return Get-InlineStringCell -Reference $Reference -Value $Value -Row $Row -Column $Column -ColumnIndex $ColumnIndex
                     }
-                    $number = $Value.ToString('G9', $config.Culture)
+                    $number = $Value.ToString('G7', $config.Culture)
+                    try { $roundTrip = [single]::Parse($number, $config.Culture) }
+                    catch { $roundTrip = $null }
+                    if ($null -eq $roundTrip -or $roundTrip -ne $Value) {
+                        $number = $Value.ToString('G9', $config.Culture)
+                    }
                     Measure-ColumnWidth -ColumnIndex $ColumnIndex -DisplayLength $number.Length
                     return '<c r="{0}"><v>{1}</v></c>' -f $Reference, $number
                 }
@@ -703,7 +738,7 @@ function Export-ToXLSX {
             $outputStream.Dispose()
             $outputStream = $null
 
-            if ([IO.File]::Exists($resolvedPath)) {
+            if (-not $NoClobber -and [IO.File]::Exists($resolvedPath)) {
                 [IO.File]::Replace(
                     $temporaryOutput,
                     $resolvedPath,

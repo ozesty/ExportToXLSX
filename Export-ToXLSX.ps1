@@ -40,6 +40,16 @@ function Export-ToXLSX {
                 '_(?=x[0-9A-Fa-f]{4}_)',
                 [Text.RegularExpressions.RegexOptions]::Compiled
             )
+            AdMetadataProperties  = [Collections.Generic.HashSet[string]]::new(
+                [string[]]@(
+                    'PropertyNames',
+                    'AddedProperties',
+                    'RemovedProperties',
+                    'ModifiedProperties',
+                    'PropertyCount'
+                ),
+                [StringComparer]::OrdinalIgnoreCase
+            )
         }
 
         Add-Type -AssemblyName System.IO.Compression
@@ -445,10 +455,21 @@ function Export-ToXLSX {
                     }
                 }
                 else {
+                    $isAdEntity = $false
+                    foreach ($typeName in $item.PSObject.TypeNames) {
+                        if ($typeName -like '*Microsoft.ActiveDirectory.Management.ADEntity*') {
+                            $isAdEntity = $true
+                            break
+                        }
+                    }
+
                     $rowValues.Clear()
                     foreach ($itemProperty in $item.PSObject.Properties) {
                         if (-not $itemProperty.IsGettable) { continue }
                         $name = $itemProperty.Name
+                        if ($isAdEntity -and $config.AdMetadataProperties.Contains($name)) {
+                            continue
+                        }
                         $columnIndex = 0
                         if (-not $columnMap.TryGetValue($name, [ref]$columnIndex)) {
                             $columnIndex = Add-Column -Name $name
